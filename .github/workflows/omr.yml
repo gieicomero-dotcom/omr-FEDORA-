@@ -1,0 +1,113 @@
+name: Riconoscimento ottico (Audiveris)
+
+on:
+  workflow_dispatch:
+    inputs:
+      pdf:
+        description: "PDF della partitura nel repository"
+        required: true
+        default: "partiture/pelleas/pelleas_kokkinis.pdf"
+      pagine:
+        description: "Pagine del PDF, per esempio 72-113"
+        required: true
+      lotto:
+        description: "Pagine per lavoro parallelo"
+        required: true
+        default: "6"
+      font:
+        description: "Font musicale (Bravura, Leland, Primus)"
+        required: true
+        default: "Bravura"
+      etichetta:
+        description: "Nome dell'esito"
+        required: true
+        default: "omr"
+      costanti:
+        description: "Costanti di Audiveris in più per questa chiamata (chiave=valore separate da spazi; vuoto = solo le impostazioni comuni)"
+        required: false
+        default: ""
+
+jobs:
+  lotti:
+    runs-on: ubuntu-24.04
+    outputs:
+      matrice: ${{ steps.m.outputs.matrice }}
+    steps:
+      - id: m
+        run: |
+          IFS=- read a b <<< "${{ inputs.pagine }}"; b=${b:-$a}; n=${{ inputs.lotto }}
+          out="["; s=$a
+          while [ $s -le $b ]; do e=$((s+n-1)); [ $e -gt $b ] && e=$b; out="$out\"$s-$e\","; s=$((e+1)); done
+          echo "matrice=${out%,}]" >> "$GITHUB_OUTPUT"
+
+  omr:
+    needs: lotti
+    runs-on: ubuntu-24.04
+    timeout-minutes: 340
+    strategy:
+      fail-fast: false
+      matrix:
+        lotto: ${{ fromJSON(needs.lotti.outputs.matrice) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Audiveris 5.11.0 e strumenti
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sudo apt-get update -q && sudo apt-get install -y -q poppler-utils
+          gh release download 5.11.0 -R Audiveris/audiveris -p '*ubuntu24.04*.deb' -D /tmp/aud
+          # estrazione diretta del pacchetto: lo script di installazione fallisce sui server senza menu grafico
+          mkdir -p /tmp/aud/x && dpkg-deb -x /tmp/aud/*.deb /tmp/aud/x
+          find /tmp/aud/x -path '*bin/Audiveris' -o -name 'Audiveris.cfg' | tee /tmp/aud/percorsi
+          CFG=$(grep '\.cfg$' /tmp/aud/percorsi | head -1)
+          sed -i 's/-Xmx[0-9]*[GgMm]/-Xmx6G/' "$CFG"; grep -n Xm "$CFG"
+          T=$HOME/.config/AudiverisLtd/audiveris/tessdata; mkdir -p "$T"
+          for l in deu ita; do curl -sSL -o "$T/$l.traineddata" "https://github.com/tesseract-ocr/tessdata/raw/4.1.0/$l.traineddata"; done
+          ls -la "$T"
+
+      - name: Pagine alla risoluzione nativa della scansione
+        run: |
+          IFS=- read a b <<< "${{ matrix.lotto }}"
+          mkdir -p pagine esito
+          pdfimages -list -f $a -l $b "${{ inputs.pdf }}" | tee esito/immagini_${{ matrix.lotto }}.txt
+          for p in $(seq $a $b); do
+            out="pagine/p$(printf %03d $p).png"
+            pdfimages -png -f $p -l $p "${{ inputs.pdf }}" /tmp/img || true
+            if [ -f /tmp/img-000.png ] && [ "$(ls /tmp/img-*.png | wc -l)" = "1" ]; then
+              mv /tmp/img-000.png "$out"            # pagina scansionata: risoluzione nativa
+            else
+              pdftoppm -r 400 -gray -png -singlefile -f $p -l $p "${{ inputs.pdf }}" "${out%.png}"   # pagina vettoriale o composta
+            fi
+            rm -f /tmp/img-*.png
+          done
+          ls -la pagine
+
+      - name: Riconoscimento
+        env:
+          COSTANTI: ${{ inputs.costanti }}
+        run: |
+          AUD=$(grep 'bin/Audiveris$' /tmp/aud/percorsi | head -1)
+          # costanti della singola chiamata: vengono dopo il file comune, quindi a parità di chiave prevalgono
+          EXTRA=(); for c in $COSTANTI; do EXTRA+=(-constant "$c"); done
+          echo "costanti in più: ${EXTRA[*]:-nessuna}" | tee esito/costanti.txt
+          for f in pagine/*.png; do
+            echo "== $f"; start=$(date +%s)
+            "$AUD" -batch -transcribe -export -output esito @impostazioni/audiveris.args \
+              -constant org.audiveris.omr.ui.symbol.MusicFont.defaultMusicFamily=${{ inputs.font }} \
+              "${EXTRA[@]}" \
+              -- "$f" > "esito/$(basename $f .png).log" 2>&1 || echo "errore su $f"
+            echo "$(basename $f) $(( $(date +%s)-start )) s" | tee -a esito/tempi.txt
+            tail -3 "esito/$(basename $f .png).log"
+          done
+          ls -la esito
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.etichetta }}-${{ matrix.lotto }}
+          path: |
+            esito/*.mxl
+            esito/*.omr
+            esito/*.log
+            esito/*.txt
+          retention-days: 30
