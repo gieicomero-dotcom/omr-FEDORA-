@@ -55,7 +55,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          sudo apt-get update -q && sudo apt-get install -y -q poppler-utils
+          sudo apt-get update -q && sudo apt-get install -y -q poppler-utils imagemagick
           gh release download 5.11.0 -R Audiveris/audiveris -p '*ubuntu24.04*.deb' -D /tmp/aud
           # estrazione diretta del pacchetto: lo script di installazione fallisce sui server senza menu grafico
           mkdir -p /tmp/aud/x && dpkg-deb -x /tmp/aud/*.deb /tmp/aud/x
@@ -101,6 +101,24 @@ jobs:
             tail -3 "esito/$(basename $f .png).log"
           done
           ls -la esito
+
+      - name: Secondo tentativo all'80% sulle pagine senza esito
+        env:
+          COSTANTI: ${{ inputs.costanti }}
+        run: |
+          AUD=$(grep 'bin/Audiveris$' /tmp/aud/percorsi | head -1)
+          EXTRA=(); for c in $COSTANTI; do EXTRA+=(-constant "$c"); done
+          for f in pagine/p*.png; do
+            n=$(basename $f .png)
+            [ -f "esito/$n.mxl" ] && continue
+            r="pagine/${n}r80.png"; convert "$f" -resize 80% "$r"
+            echo "== ritento $r"
+            "$AUD" -batch -transcribe -export -output esito @impostazioni/audiveris.args \
+              -constant org.audiveris.omr.ui.symbol.MusicFont.defaultMusicFamily=${{ inputs.font }} \
+              "${EXTRA[@]}" \
+              -- "$r" > "esito/${n}r80.log" 2>&1 || echo "errore su $r"
+            [ -f "esito/${n}r80.mxl" ] && echo "$n riuscita all'80%" || echo "$n fallita anche all'80%"
+          done | tee esito/ritentativi.txt
 
       - uses: actions/upload-artifact@v4
         with:
